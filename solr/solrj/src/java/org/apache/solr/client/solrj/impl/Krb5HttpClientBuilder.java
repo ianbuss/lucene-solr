@@ -48,20 +48,28 @@ import org.slf4j.LoggerFactory;
  * Kerberos-enabled SolrHttpClientBuilder
  */
 public class Krb5HttpClientBuilder implements HttpClientBuilderFactory {
-  
+
+  private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+
   public static final String LOGIN_CONFIG_PROP = "java.security.auth.login.config";
-  private static final Logger log = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
-  
+  public static final String USE_SUBJECT_CREDS_PROP = "javax.security.auth.useSubjectCredsOnly";
+  public static final boolean DEFAULT_USE_SYSTEM_LOGIN_CONFIG = true;
+
   private static Configuration jaasConfig = new SolrJaasConfiguration();
 
-  public Krb5HttpClientBuilder() {
+  private boolean useSystemLoginConfig;
 
+  public Krb5HttpClientBuilder() {
+    this(DEFAULT_USE_SYSTEM_LOGIN_CONFIG);
+  }
+
+  public Krb5HttpClientBuilder(boolean useSystemLoginConfig) {
+    this.useSystemLoginConfig = useSystemLoginConfig;
   }
 
   /**
-   * The jaasConfig is static, which makes it problematic for testing in the same jvm.
-   * Call this function to regenerate the static config (this is not thread safe).
-   * Note: only used for tests
+   * The jaasConfig is static, which makes it problematic for testing in the same jvm. Call this
+   * function to regenerate the static config (this is not thread safe). Note: only used for tests
    */
   public static void regenerateJaasConfiguration() {
     jaasConfig = new SolrJaasConfiguration();
@@ -70,7 +78,7 @@ public class Krb5HttpClientBuilder implements HttpClientBuilderFactory {
   public SolrHttpClientBuilder getBuilder() {
     return getBuilder(HttpClientUtil.getHttpClientBuilder());
   }
-  
+
   public void close() {
     HttpClientUtil.removeRequestInterceptor(bufferedEntityInterceptor);
   }
@@ -81,74 +89,81 @@ public class Krb5HttpClientBuilder implements HttpClientBuilderFactory {
   }
 
   public SolrHttpClientBuilder getBuilder(SolrHttpClientBuilder builder) {
-    if (System.getProperty(LOGIN_CONFIG_PROP) != null) {
+    if (useSystemLoginConfig && System.getProperty(LOGIN_CONFIG_PROP) != null) {
       String configValue = System.getProperty(LOGIN_CONFIG_PROP);
+      logger.info("Setting up SPNego auth with config: " + configValue);
+      
+      String useSubjectCredsVal = System.getProperty(USE_SUBJECT_CREDS_PROP);
 
-      if (configValue != null) {
-        log.info("Setting up SPNego auth with config: " + configValue);
-        final String useSubjectCredsProp = "javax.security.auth.useSubjectCredsOnly";
-        String useSubjectCredsVal = System.getProperty(useSubjectCredsProp);
-
-        // "javax.security.auth.useSubjectCredsOnly" should be false so that the underlying
-        // authentication mechanism can load the credentials from the JAAS configuration.
-        if (useSubjectCredsVal == null) {
-          System.setProperty(useSubjectCredsProp, "false");
-        }
-        else if (!useSubjectCredsVal.toLowerCase(Locale.ROOT).equals("false")) {
-          // Don't overwrite the prop value if it's already been written to something else,
-          // but log because it is likely the Credentials won't be loaded correctly.
-          log.warn("System Property: " + useSubjectCredsProp + " set to: " + useSubjectCredsVal
-              + " not false.  SPNego authentication may not be successful.");
-        }
-
-        javax.security.auth.login.Configuration.setConfiguration(jaasConfig);
-        //Enable only SPNEGO authentication scheme.
-
-        builder.setAuthSchemeRegistryProvider(() -> {
-          Lookup<AuthSchemeProvider> authProviders = RegistryBuilder.<AuthSchemeProvider>create()
-              .register(AuthSchemes.SPNEGO, new SPNegoSchemeFactory(true, false))
-              .build();
-          return authProviders;
-        });
-        // Get the credentials from the JAAS configuration rather than here
-        Credentials useJaasCreds = new Credentials() {
-          public String getPassword() {
-            return null;
-          }
-          public Principal getUserPrincipal() {
-            return null;
-          }
-        };
-
-        HttpClientUtil.setCookiePolicy(SolrPortAwareCookieSpecFactory.POLICY_NAME);
-
-        builder.setCookieSpecRegistryProvider(() -> {
-          SolrPortAwareCookieSpecFactory cookieFactory = new SolrPortAwareCookieSpecFactory();
-
-          Lookup<CookieSpecProvider> cookieRegistry = RegistryBuilder.<CookieSpecProvider> create()
-              .register(SolrPortAwareCookieSpecFactory.POLICY_NAME, cookieFactory).build();
-
-          return cookieRegistry;
-        });
-        
-        builder.setDefaultCredentialsProvider(() -> {
-          CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
-          credentialsProvider.setCredentials(AuthScope.ANY, useJaasCreds);
-          return credentialsProvider;
-        });
-        HttpClientUtil.addRequestInterceptor(bufferedEntityInterceptor);
+      // "javax.security.auth.useSubjectCredsOnly" should be false so that the underlying
+      // authentication mechanism can load the credentials from the JAAS configuration.
+      if (useSubjectCredsVal == null) {
+        System.setProperty(USE_SUBJECT_CREDS_PROP, "false");
+      } else if (!useSubjectCredsVal.toLowerCase(Locale.ROOT).equals("false")) {
+        // Don't overwrite the prop value if it's already been written to something else,
+        // but log because it is likely the Credentials won't be loaded correctly.
+        logger.warn("System Property: {} set to: {} not false. " + 
+          "SPNego authentication may not be successful.", USE_SUBJECT_CREDS_PROP, useSubjectCredsVal);
       }
-    } else {
-      log.warn("{} is configured without specifying system property '{}'",
+
+      Configuration.setConfiguration(jaasConfig);
+      // Enable only SPNEGO authentication scheme.  
+      builder = configureBuilderForSPNego(builder);
+    } else if (useSystemLoginConfig) {
+      logger.warn("{} was constructed without either specifying system property '{}' " +
+          "or indicating that this property should not be used",
           getClass().getName(), LOGIN_CONFIG_PROP);
+    } else {
+      logger.info("SPNego auth will use Subject in calling access controller context");
+      // Enable only SPNEGO authentication scheme.  
+      builder = configureBuilderForSPNego(builder);
     }
+    
+    return builder;
+  }
+
+  private SolrHttpClientBuilder configureBuilderForSPNego(SolrHttpClientBuilder builder) {
+    // Set the authentication scheme registry to SPNego only
+    builder.setAuthSchemeRegistryProvider(() -> {
+      Lookup<AuthSchemeProvider> authProviders = RegistryBuilder.<AuthSchemeProvider>create()
+          .register(AuthSchemes.SPNEGO, new SPNegoSchemeFactory(true, false)).build();
+      return authProviders;
+    });
+
+    HttpClientUtil.setCookiePolicy(SolrPortAwareCookieSpecFactory.POLICY_NAME);
+    builder.setCookieSpecRegistryProvider(() -> {
+      SolrPortAwareCookieSpecFactory cookieFactory = new SolrPortAwareCookieSpecFactory();
+
+      Lookup<CookieSpecProvider> cookieRegistry = RegistryBuilder.<CookieSpecProvider>create()
+          .register(SolrPortAwareCookieSpecFactory.POLICY_NAME, cookieFactory).build();
+
+      return cookieRegistry;
+    });
+
+    // Get the credentials from the JAAS configuration rather than here
+    Credentials useJaasCreds = new Credentials() {
+      public String getPassword() {
+        return null;
+      }
+
+      public Principal getUserPrincipal() {
+        return null;
+      }
+    };
+    builder.setDefaultCredentialsProvider(() -> {
+      CredentialsProvider credentialsProvider = new BasicCredentialsProvider();
+      credentialsProvider.setCredentials(AuthScope.ANY, useJaasCreds);
+      return credentialsProvider;
+    });
+
+    HttpClientUtil.addRequestInterceptor(bufferedEntityInterceptor);
 
     return builder;
   }
 
   // Set a buffered entity based request interceptor
   private HttpRequestInterceptor bufferedEntityInterceptor = (request, context) -> {
-    if(request instanceof HttpEntityEnclosingRequest) {
+    if (request instanceof HttpEntityEnclosingRequest) {
       HttpEntityEnclosingRequest enclosingRequest = ((HttpEntityEnclosingRequest) request);
       HttpEntity requestEntity = enclosingRequest.getEntity();
       enclosingRequest.setEntity(new BufferedHttpEntity(requestEntity));
@@ -157,16 +172,19 @@ public class Krb5HttpClientBuilder implements HttpClientBuilderFactory {
 
   private static class SolrJaasConfiguration extends javax.security.auth.login.Configuration {
 
+    public static final String JGSS_KRB5_INIT = "com.sun.security.jgss.krb5.initiate";
+    public static final String JGSS_INIT = "com.sun.security.jgss.initiate";
+    public static final String SOLR_KRB_APPNAME = "solr.kerberos.jaas.appname";
+    public static final String DEFAULT_SOLR_KRB_APPNAME = "Client";
+
     private javax.security.auth.login.Configuration baseConfig;
 
     // the com.sun.security.jgss appNames
-    private Set<String> initiateAppNames = new HashSet(
-      Arrays.asList("com.sun.security.jgss.krb5.initiate", "com.sun.security.jgss.initiate"));
+    private Set<String> initiateAppNames = new HashSet<>(Arrays.asList(JGSS_KRB5_INIT, JGSS_INIT));
 
     public SolrJaasConfiguration() {
       try {
-        
-        this.baseConfig = javax.security.auth.login.Configuration.getConfiguration();
+        this.baseConfig = Configuration.getConfiguration();
       } catch (SecurityException e) {
         this.baseConfig = null;
       }
@@ -174,13 +192,15 @@ public class Krb5HttpClientBuilder implements HttpClientBuilderFactory {
 
     @Override
     public AppConfigurationEntry[] getAppConfigurationEntry(String appName) {
-      if (baseConfig == null) return null;
+      if (baseConfig == null)
+        return null;
 
-      log.debug("Login prop: "+System.getProperty(LOGIN_CONFIG_PROP));
+      logger.debug("Login prop: {}", System.getProperty(LOGIN_CONFIG_PROP));
 
-      String clientAppName = System.getProperty("solr.kerberos.jaas.appname", "Client");
+      String clientAppName = System.getProperty(SOLR_KRB_APPNAME, DEFAULT_SOLR_KRB_APPNAME);
       if (initiateAppNames.contains(appName)) {
-        log.debug("Using AppConfigurationEntry for appName '"+clientAppName+"' instead of: " + appName);
+        logger.debug("Using AppConfigurationEntry for appName '{}' instead of: {}", 
+          clientAppName, appName);
         return baseConfig.getAppConfigurationEntry(clientAppName);
       }
       return baseConfig.getAppConfigurationEntry(appName);
